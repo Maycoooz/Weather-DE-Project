@@ -51,7 +51,7 @@ wind direction, wind gusts, UV index, cloud cover, weather code, visibility
    per city with avg/min/max temperature, total precipitation, dominant categories
 4. **Quality Checks** (`quality_checks.py`) — validates row counts, nulls, 
    temperature ranges, city completeness, and duplicates. Results logged to 
-   bronze.pipeline_runs
+   `bronze.pipeline_runs`
 
 ## Airflow DAG
 
@@ -69,6 +69,7 @@ weather-de-project/
 ├── transform.py             # Silver layer — cleaning and enrichment
 ├── gold.py                  # Gold layer — daily aggregations
 ├── quality_checks.py        # Data quality validation
+├── backfill.py              # Manual backfill for missing historical days
 ├── requirements.txt         # Python dependencies
 ├── docker-compose.yml       # Airflow + PostgreSQL containers
 └── README.md
@@ -106,11 +107,112 @@ DB_USER=postgres
 DB_PASSWORD=your_password
 ```
 
-4. Create the database schemas in PostgreSQL
+4. Create the database, schemas, and tables in PostgreSQL
 ```sql
-CREATE SCHEMA bronze;
-CREATE SCHEMA silver;
-CREATE SCHEMA gold;
+CREATE DATABASE weather_pipeline
+    WITH
+    OWNER = postgres
+    ENCODING = 'UTF8'
+    LC_COLLATE = 'English_Singapore.1252'
+    LC_CTYPE = 'English_Singapore.1252'
+    LOCALE_PROVIDER = 'libc'
+    TABLESPACE = pg_default
+    CONNECTION LIMIT = -1
+    IS_TEMPLATE = False;
+```
+
+Then connect to the `weather_pipeline` database and run:
+
+```sql
+-- Bronze
+CREATE SCHEMA IF NOT EXISTS bronze;
+
+CREATE TABLE IF NOT EXISTS bronze.weather_raw (
+    id                        SERIAL PRIMARY KEY,
+    ingested_at               TIMESTAMP DEFAULT NOW(),
+    city                      VARCHAR(100),
+    date                      TIMESTAMPTZ,
+    temperature_2m            FLOAT,
+    relative_humidity_2m      FLOAT,
+    apparent_temperature      FLOAT,
+    precipitation_probability FLOAT,
+    precipitation             FLOAT,
+    rain                      FLOAT,
+    wind_speed_10m            FLOAT,
+    wind_direction_10m        FLOAT,
+    wind_gusts_10m            FLOAT,
+    weather_code              FLOAT,
+    visibility                FLOAT,
+    uv_index                  FLOAT,
+    cloud_cover               FLOAT
+);
+
+CREATE TABLE IF NOT EXISTS bronze.pipeline_runs (
+    id           SERIAL PRIMARY KEY,
+    run_at       TIMESTAMP DEFAULT NOW(),
+    stage        VARCHAR(50),
+    status       VARCHAR(20),
+    rows_checked INT,
+    issues_found INT,
+    details      TEXT
+);
+
+-- Silver
+CREATE SCHEMA IF NOT EXISTS silver;
+
+CREATE TABLE IF NOT EXISTS silver.weather_cleaned (
+    id                        SERIAL PRIMARY KEY,
+    ingested_at               TIMESTAMPTZ,
+    transformed_at            TIMESTAMPTZ,
+    city                      VARCHAR(100),
+    date                      TIMESTAMPTZ,
+    temperature_2m            FLOAT,
+    relative_humidity_2m      FLOAT,
+    apparent_temperature      FLOAT,
+    precipitation_probability FLOAT,
+    precipitation             FLOAT,
+    rain                      FLOAT,
+    wind_speed_10m            FLOAT,
+    wind_direction_10m        FLOAT,
+    wind_gusts_10m            FLOAT,
+    weather_code              INT,
+    visibility                FLOAT,
+    uv_index                  FLOAT,
+    cloud_cover               FLOAT,
+    feels_hotter              BOOLEAN,
+    heat_category             VARCHAR(20),
+    rain_category             VARCHAR(20),
+    wind_category             VARCHAR(20),
+    is_extreme_weather        BOOLEAN
+);
+
+-- Gold
+CREATE SCHEMA IF NOT EXISTS gold;
+
+CREATE TABLE IF NOT EXISTS gold.weather_daily (
+    id                       SERIAL PRIMARY KEY,
+    city                     VARCHAR(100),
+    day                      DATE,
+    avg_temperature          FLOAT,
+    min_temperature          FLOAT,
+    max_temperature          FLOAT,
+    avg_apparent_temperature FLOAT,
+    avg_humidity             FLOAT,
+    total_precipitation      FLOAT,
+    max_precipitation        FLOAT,
+    avg_wind_speed           FLOAT,
+    max_wind_gusts           FLOAT,
+    avg_cloud_cover          FLOAT,
+    max_uv_index             FLOAT,
+    avg_visibility           FLOAT,
+    dominant_heat_category   VARCHAR(20),
+    dominant_rain_category   VARCHAR(20),
+    dominant_wind_category   VARCHAR(20),
+    extreme_weather_hours    INT,
+    feels_hotter_hours       INT,
+    hours_of_data            INT,
+    loaded_at                TIMESTAMPTZ DEFAULT NOW()
+);
 ```
 
 5. Start Airflow
@@ -126,6 +228,49 @@ python transform.py
 python gold.py
 python quality_checks.py
 ```
+
+## Backfilling Missing Data
+
+If the pipeline misses a day (e.g. Airflow was down, or the API was unreachable),
+`backfill.py` recovers missing days by fetching from the Open-Meteo historical API
+and running the full pipeline — ingest, transform, gold aggregation, and quality 
+checks — for each missing day. Results are logged to `bronze.pipeline_runs` exactly 
+like a normal pipeline run.
+
+### Usage
+
+```bash
+# Backfill a specific date range
+python backfill.py --start 2026-03-01 --end 2026-03-05
+
+# Backfill from a start date up to yesterday
+python backfill.py --start 2026-03-01
+
+# Backfill the last N days
+python backfill.py --days 7
+
+# Force re-process days even if bronze data already exists
+python backfill.py --start 2026-03-01 --end 2026-03-05 --force
+
+# Rebuild silver and gold from existing bronze without hitting the API
+python backfill.py --start 2026-03-01 --end 2026-03-05 --skip-bronze
+```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `--start` | Start date in YYYY-MM-DD format |
+| `--end` | End date in YYYY-MM-DD format (defaults to yesterday) |
+| `--days N` | Backfill the last N days instead of a fixed range |
+| `--force` | Re-process days even if bronze data already exists |
+| `--skip-bronze` | Rebuild silver and gold from existing bronze without hitting the API — useful for fixing downstream layer issues without risking bronze duplication |
+
+### Notes
+
+- **Safe to re-run** — skips any day that already has bronze data by default, so running it multiple times without `--force` will not create duplicates
+- **First day of the pipeline** may have fewer than 120 silver rows if the pipeline first ran mid-day — this is expected and not a data quality issue
+- The Open-Meteo API returns some hours beyond midnight UTC, so a small number of rows with tomorrow's UTC date will appear in bronze and silver — this is normal and those rows are picked up by the following day's pipeline run
 
 ## Data Quality Checks
 
@@ -155,3 +300,4 @@ Power BI dashboard connected directly to the PostgreSQL gold layer showing:
 - Docker and docker-compose for local development
 - Data quality monitoring and audit logging
 - Power BI connected to a live PostgreSQL warehouse
+- Backfill patterns for recovering missing historical data
